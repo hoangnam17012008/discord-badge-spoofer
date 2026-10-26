@@ -4,18 +4,15 @@
   "use strict";
 
   const config = {
-    guildId: "1237417691812335628",
-    channelId: "1237467715795419196",
     hours: 5000,
     dryRun: false,
   };
   const label = "[kanashi-stream]";
   const validId = (id) => /^\d{17,20}$/.test(id);
   const durationMs = config.hours * 3_600_000;
-  if (!validId(config.guildId) || !validId(config.channelId) ||
-      !Number.isFinite(durationMs) || durationMs < 1 ||
+  if (!Number.isFinite(durationMs) || durationMs < 1 ||
       durationMs > Math.min(Date.now(), Number.MAX_SAFE_INTEGER)) {
-    console.error(label, "invalid guild/channel ID or duration");
+    console.error(label, "invalid duration");
     return;
   }
   if (!Array.isArray(window.webpackChunkdiscord_app)) {
@@ -27,14 +24,51 @@
   // logged, or stored by this script.
   const runtime = window.webpackChunkdiscord_app.push([[Symbol()], {}, (require) => require]);
   window.webpackChunkdiscord_app.pop();
+  const findExport = (predicate) => {
+    for (const mod of Object.values(runtime.c)) {
+      if (!mod?.exports) continue;
+      const exports = mod.exports;
+      const candidates = [exports, exports.default, ...Object.values(exports)];
+      const found = candidates.find(predicate);
+      if (found) return found;
+    }
+    return null;
+  };
+  const userStore = findExport((value) => typeof value?.getCurrentUser === "function");
+  const voiceStore = findExport((value) =>
+    typeof value?.getVoiceStateForUser === "function" &&
+    typeof value?.isCurrentClientInVoiceChannel === "function"
+  );
+  const channelStore = findExport((value) =>
+    typeof value?.getChannel === "function" &&
+    typeof value?.getMutableGuildChannelsForGuild === "function"
+  );
+  if (!userStore || !voiceStore || !channelStore) {
+    console.error(label, "voice/channel stores not found; this client version may differ");
+    return;
+  }
+  const userId = userStore.getCurrentUser()?.id;
+  const voiceState = userId && voiceStore.getVoiceStateForUser(userId);
+  const channelId = voiceState?.channelId;
+  const channel = channelId && channelStore.getChannel(channelId);
+  const guildId = channel && (channel.getGuildId?.() ?? channel.guild_id);
+  if (!voiceStore.isCurrentClientInVoiceChannel() ||
+      !validId(channelId) || !validId(guildId)) {
+    console.error(label, "join a server voice channel before running this script");
+    return;
+  }
+
   const isRest = (value) => value && ["get", "post", "del"].every(
     (method) => typeof value[method] === "function"
   );
+  // A generic method-name scan can select Discord's localization proxy:
+  // it also exposes get/post/del but treats REST arguments as message keys.
+  // Search only modules whose factory identifies the HTTP utilities.
   let rest = null;
-  for (const mod of Object.values(runtime.c)) {
-    if (!mod?.exports) continue;
-    const exports = mod.exports;
-    const candidates = [exports, exports.default, ...Object.values(exports)];
+  for (const [id, factory] of Object.entries(runtime.m ?? {})) {
+    if (!factory.toString().includes("HTTPUtils")) continue;
+    const exports = runtime(id);
+    const candidates = [exports, exports?.default, ...Object.values(exports ?? {})];
     rest = candidates.find(isRest);
     if (rest) break;
   }
@@ -63,8 +97,8 @@
   const heartbeatId = crypto.randomUUID();
   const launchSignature = crypto.randomUUID();
   const common = {
-    guild_id: config.guildId,
-    channel_id: config.channelId,
+    guild_id: guildId,
+    channel_id: channelId,
     channel_type: 2,
     client_heartbeat_session_id: heartbeatId,
     launch_signature: launchSignature,
@@ -91,7 +125,7 @@
   }));
 
   if (config.dryRun) {
-    console.log(label, "preview only; nothing sent", { hours: config.hours, events });
+    console.log(label, "preview only; nothing sent", { guildId, channelId, hours: config.hours, events });
     return;
   }
   try {
@@ -100,6 +134,8 @@
       body: { token: analyticsToken, events },
     });
     console.log(label, "telemetry request completed", {
+      guildId,
+      channelId,
       status: response?.status ?? "not exposed by client REST module",
       badgeProgressVerified: false,
     });

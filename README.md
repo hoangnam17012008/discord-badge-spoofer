@@ -82,7 +82,7 @@ This sequence was informed by the public [discord-streamer](https://github.com/l
 
 ## Discord desktop console experiment
 
-[stream_console.js](stream_console.js) is a single-file JavaScript version of the Streaming telemetry probe for the Discord desktop client developer console. It uses the client’s existing authenticated REST session, so no account token is pasted into the script. Edit `guildId`, `channelId` and `hours` at the top before running. Set `dryRun: true` for an offline preview; the provided file has `dryRun: false` and posts one batch when pasted into the console. Do not paste scripts from untrusted sources into a logged-in client.
+[stream_console.js](stream_console.js) is a single-file JavaScript version of the Streaming telemetry probe for the Discord desktop client developer console. It uses the client’s existing authenticated REST session, so no account token is pasted into the script. Join a server voice channel first; the script reads its channel and guild IDs from Discord’s current voice state. Edit `hours` at the top if needed. Set `dryRun: true` for an offline preview; the provided file has `dryRun: false` and posts one batch when pasted into the console. Do not paste scripts from untrusted sources into a logged-in client.
 
 This is a telemetry experiment only. It creates no voice/stream session, WebRTC media, or viewer. A resolved request or HTTP `204` does not establish that badge time increased. The official Discord badge criteria still apply. There is no automatic repeat or claim of success in the script.
 
