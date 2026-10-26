@@ -15,11 +15,6 @@
     console.error(label, "invalid duration");
     return;
   }
-  if (!Array.isArray(window.webpackChunkdiscord_app)) {
-    console.error(label, "open this in the Discord desktop client");
-    return;
-  }
-
   // Find the client's authenticated REST module. No account token is copied,
   // logged, or stored by this script.
   const runtime = window.webpackChunkdiscord_app.push([[Symbol()], {}, (require) => require]);
