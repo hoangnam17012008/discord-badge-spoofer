@@ -9,7 +9,7 @@ async function run({ inVoice }) {
   const calls = [];
   const output = [];
   const wrongGet = async () => { throw Error('localization module selected'); };
-  const localization = { get: wrongGet, post: wrongGet, del: wrongGet };
+  const localization = { get: wrongGet, post: wrongGet, del: wrongGet, getName: () => 'LocalizationStore' };
   const rest = {
     get: async (request) => {
       calls.push(['get', request]);
@@ -22,6 +22,7 @@ async function run({ inVoice }) {
     del: async () => {},
   };
   const voice = {
+    getName: () => 'VoiceStateStore',
     getVoiceStateForUser: () => inVoice ? { channelId: '123456789012345679' } : undefined,
     isCurrentClientInVoiceChannel: () => inVoice,
   };
@@ -29,9 +30,10 @@ async function run({ inVoice }) {
   runtime.m = { http: function HTTPUtils() {} };
   runtime.c = {
     locale: { exports: localization },
-    user: { exports: { getCurrentUser: () => ({ id: '123456789012345677' }) } },
+    user: { exports: { getName: () => 'UserStore', getCurrentUser: () => ({ id: '123456789012345677' }) } },
     voice: { exports: voice },
     channel: { exports: {
+      getName: () => 'ChannelStore',
       getChannel: (id) => id === '123456789012345679'
         ? { getGuildId: () => '123456789012345678' } : undefined,
       getMutableGuildChannelsForGuild: () => ({}),

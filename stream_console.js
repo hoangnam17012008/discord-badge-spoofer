@@ -34,16 +34,21 @@
     }
     return null;
   };
-  const userStore = findExport((value) => typeof value?.getCurrentUser === "function");
-  const voiceStore = findExport((value) =>
-    typeof value?.getVoiceStateForUser === "function" &&
-    typeof value?.isCurrentClientInVoiceChannel === "function"
-  );
-  const channelStore = findExport((value) =>
-    typeof value?.getChannel === "function" &&
-    typeof value?.getMutableGuildChannelsForGuild === "function"
-  );
-  if (!userStore || !voiceStore || !channelStore) {
+  const findStore = (name) => findExport((value) => {
+    try {
+      return typeof value?.getName === "function" && value.getName() === name;
+    } catch {
+      return false;
+    }
+  });
+  const userStore = findStore("UserStore");
+  const voiceStore = findStore("VoiceStateStore");
+  const channelStore = findStore("ChannelStore");
+  if (!userStore || !voiceStore || !channelStore ||
+      typeof userStore.getCurrentUser !== "function" ||
+      typeof voiceStore.getVoiceStateForUser !== "function" ||
+      typeof voiceStore.isCurrentClientInVoiceChannel !== "function" ||
+      typeof channelStore.getChannel !== "function") {
     console.error(label, "voice/channel stores not found; this client version may differ");
     return;
   }
