@@ -9,7 +9,13 @@ async function run({ inVoice }) {
   const calls = [];
   const output = [];
   const wrongGet = async () => { throw Error('localization module selected'); };
-  const localization = { get: wrongGet, post: wrongGet, del: wrongGet, getName: () => 'LocalizationStore' };
+  let localeGetNameReads = 0;
+  const localization = new Proxy({ get: wrongGet, post: wrongGet, del: wrongGet }, {
+    get(target, key) {
+      if (key === 'getName') { localeGetNameReads++; return () => 'LocalizationStore'; }
+      return Reflect.get(target, key);
+    },
+  });
   const rest = {
     get: async (request) => {
       calls.push(['get', request]);
@@ -48,11 +54,12 @@ async function run({ inVoice }) {
     console: { log: (...args) => output.push(args), error: (...args) => output.push(args) },
   };
   await vm.runInNewContext(source, context);
-  return { calls, output };
+  return { calls, output, localeGetNameReads };
 }
 
 (async () => {
-  const { calls, output } = await run({ inVoice: true });
+  const { calls, output, localeGetNameReads } = await run({ inVoice: true });
+  assert.equal(localeGetNameReads, 0);
   assert.equal(calls.length, 2);
   assert.equal(calls[0][0], 'get');
   assert.equal(calls[1][0], 'post');

@@ -34,12 +34,24 @@
     }
     return null;
   };
-  const findStore = (name) => findExport((value) => {
+  const hasDeclaredMethod = (value, method) => {
     try {
-      return typeof value?.getName === "function" && value.getName() === name;
+      for (let proto = value, depth = 0; proto && depth < 8;
+           proto = Object.getPrototypeOf(proto), depth++) {
+        if (typeof Object.getOwnPropertyDescriptor(proto, method)?.value === "function") {
+          return true;
+        }
+      }
     } catch {
-      return false;
+      // Some Discord exports are dynamic proxies. Do not read arbitrary keys
+      // on them; localization proxies log warnings for every unknown key.
     }
+    return false;
+  };
+  const findStore = (name) => findExport((value) => {
+    if (!value || !hasDeclaredMethod(value, "getName")) return false;
+    try { return value.getName() === name; }
+    catch { return false; }
   });
   const userStore = findStore("UserStore");
   const voiceStore = findStore("VoiceStateStore");
