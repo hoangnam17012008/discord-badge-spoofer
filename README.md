@@ -80,6 +80,12 @@ The preview reads no account state and sends no network traffic. To try **one** 
 
 This sequence was informed by the public [discord-streamer](https://github.com/lawerth/discord-streamer) experiment. That project also runs an actual WebRTC broadcast and a viewer; this probe does **not**. A `204` response establishes only that Discord accepted the telemetry request. It does not establish that Streaming badge hours increased. No authenticated test or badge-progress comparison was possible during development. Discord's [official badge guide](https://support.discord.com/hc/en-us/articles/44369363856663-Discord-Profile-Badges-What-Each-Badge-Means) says time counts while a Discord desktop stream has at least one other person in the call, with activity-personalization enabled. The offline probe does not meet those conditions.
 
+## Discord desktop console experiment
+
+[stream_console.js](stream_console.js) is a single-file JavaScript version of the Streaming telemetry probe for the Discord desktop client developer console. It uses the client’s existing authenticated REST session, so no account token is pasted into the script. Edit `guildId`, `channelId` and `hours` at the top before running. Set `dryRun: true` for an offline preview; the provided file has `dryRun: false` and posts one batch when pasted into the console. Do not paste scripts from untrusted sources into a logged-in client.
+
+This is a telemetry experiment only. It creates no voice/stream session, WebRTC media, or viewer. A resolved request or HTTP `204` does not establish that badge time increased. The official Discord badge criteria still apply. There is no automatic repeat or claim of success in the script.
+
 ## Validation
 
 ```sh
