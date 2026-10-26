@@ -30,7 +30,7 @@ jobs:
           assert old in src, "anchor line not found"
           p.write_text(src.replace(old, new), encoding="utf-8")
 
-      - run: pyinstaller --onefile --clean --name spoofer spoofer.py
+      - run: pyinstaller --onefile --clean --name kanashi spoofer.py
 
       - name: release
         shell: bash
@@ -40,4 +40,4 @@ jobs:
         run: |
           tag="${SHA:0:6}"
           gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$tag" dist/spoofer.exe --title "$tag" --latest
+          gh release create "$tag" dist/kanashi.exe --title "$tag" --latest

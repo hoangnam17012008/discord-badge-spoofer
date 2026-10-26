@@ -1,0 +1,4 @@
+[
+  {"id": "1", "name": "Offline Example One", "executables": [{"os": "win32", "name": "example-one.exe"}]},
+  {"id": "2", "name": "Offline Example Two", "executables": [{"os": "win32", "name": "example-two.exe"}]}
+]
