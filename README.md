@@ -86,6 +86,12 @@ This sequence was informed by the public [discord-streamer](https://github.com/l
 
 This is a telemetry experiment only. It creates no voice/stream session, WebRTC media, or viewer. A resolved request or HTTP `204` does not establish that badge time increased. The official Discord badge criteria still apply. There is no automatic repeat or claim of success in the script.
 
+## Real-time Discord desktop stream helper
+
+[stream_live_console.js](stream_live_console.js) is a paste-into-console helper for Discord Desktop. Its `CHANNEL_ID` is set to `1237467715795419196`; change that constant to use another server voice channel. It joins that channel through Discord's own voice action, opens the normal **Share Your Screen** control when possible, and reports elapsed local monitor time only while the client says a stream is active. It does not fabricate any duration or post analytics events.
+
+The user must select a screen or window and confirm Go Live in Discord's picker. Browser/desktop security does not allow a console script to grant screen-capture permission silently. Discord and its viewer requirements determine badge credit. If the Share Screen button cannot be located in a different client language or layout, click it manually after the helper joins voice. The script uses private client stores, so a future Discord update may require adjusting the lookup.
+
 ## Validation
 
 ```sh
