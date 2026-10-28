@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-discord science spoofer - inflate the playtime and games-played badges.
+kanashi - Discord badge CLI.
 
-revere group, 2026. mit licensed (see LICENSE).
+MIT licensed (see LICENSE for the original copyright notice).
 
 posts launch_game and running_game_heartbeat events to /api/v9/science, the same
 endpoint the real client uses to credit playtime. duration_tracked_ms isn't
@@ -13,7 +13,7 @@ run:
 
 auth bits:
     token            your account token, entered on first run           [saved]
-    cookie           cf_clearance, pasted by hand via menu option 3     [saved]
+    cookie           cf_clearance, parsed from supplied cookies          [saved]
     fingerprint      optional, only for the games-played count          [saved]
     analytics_token  fetched from GET /users/@me?with_analytics_token=true, cached
     super_props      from cordapi.dolfi.es (fallback: local)            [per run]
@@ -24,15 +24,20 @@ this breaks discord tos. your account, your problem.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
+import math
 import os
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
-import webbrowser
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from http.cookies import SimpleCookie
+from urllib.parse import urlsplit
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict
@@ -54,10 +59,6 @@ ME_URL = "https://discord.com/api/v9/users/@me?with_analytics_token=true"
 SCIENCE_URL = "https://discord.com/api/v9/science"
 PROPERTIES_URL = "https://cordapi.dolfi.es/api/v2/properties/windows"  # current super_props, local fallback
 GAMES_CDN_URL = "https://cdn.discordapp.com/detectables/games.json"  # used if games.json isn't there
-SUBSCRIBE_URL = "https://www.youtube.com/@solasity?sub_confirmation=1"
-DISCORD_INVITE_LABEL = "discord.gg/QEC6QttWMh"
-DISCORD_INVITE_URL = "https://discord.gg/QEC6QttWMh"
-GATE_WAIT = 10            # seconds before enter is accepted on each setup step
 
 BATCH_SIZE = 50           # events per /science request
 BATCH_DELAY = 1           # seconds between requests
@@ -75,6 +76,133 @@ USER_AGENT = (
     "Electron/42.7.1 Safari/537.36"
 )
 
+
+
+_HTTP = threading.local()
+_PROXY: str | None = None
+
+
+def configure_proxy(proxy: str | None) -> None:
+    """Configure one stable proxy for the entire session; otherwise use system settings."""
+    global _PROXY, _HTTP
+    if proxy:
+        try:
+            parsed = urlsplit(proxy)
+            valid = (parsed.scheme in ("http", "https") and parsed.hostname
+                     and parsed.port is not None and not parsed.query
+                     and not parsed.fragment and parsed.path in ("", "/"))
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("proxy must be http(s)://[user:password@]host:port")
+    _PROXY = proxy
+    _HTTP = threading.local()
+
+
+def open_url(request, timeout: int):
+    if not hasattr(_HTTP, "opener"):
+        handler = (urllib.request.ProxyHandler({"http": _PROXY, "https": _PROXY})
+                   if _PROXY else urllib.request.ProxyHandler())
+        _HTTP.opener = urllib.request.build_opener(handler)
+    return _HTTP.opener.open(request, timeout=timeout)
+
+
+def extract_clearance(raw: str) -> str:
+    """Extract an existing cf_clearance from headers, JSON or Netscape exports."""
+    raw = raw.strip()
+    values: set[str] = set()
+
+    def add(name, value, domain=None):
+        if name != "cf_clearance":
+            return
+        if domain is not None and str(domain).lstrip(".").lower() not in ("discord.com", "www.discord.com"):
+            return
+        if isinstance(value, str) and value and not any(c.isspace() or c in ";\r\n" for c in value):
+            values.add(value)
+
+    if raw.startswith(("[", "{")):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid cookie JSON") from exc
+        if isinstance(data, dict) and "cookies" in data:
+            data = data["cookies"]
+        if isinstance(data, dict):
+            if "name" in data:
+                add(data.get("name"), data.get("value"), data.get("domain"))
+            else:
+                add("cf_clearance", data.get("cf_clearance"))
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    add(item.get("name"), item.get("value"), item.get("domain"))
+    elif "\t" in raw:
+        for line in raw.splitlines():
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) == 7:
+                add(parts[5], parts[6], parts[0])
+    else:
+        if raw.lower().startswith("cookie:"):
+            raw = raw.split(":", 1)[1].strip()
+        if "\r" in raw or "\n" in raw:
+            raise ValueError("paste only the Cookie header, not an entire HTTP request")
+        cookies = SimpleCookie()
+        try:
+            cookies.load(raw)
+        except Exception as exc:
+            raise ValueError("invalid Cookie header") from exc
+        if "cf_clearance" in cookies:
+            # SimpleCookie keeps only the last duplicate; detect conflicts explicitly.
+            for part in raw.split(";"):
+                item = SimpleCookie()
+                item.load(part.strip())
+                if "cf_clearance" in item:
+                    add("cf_clearance", item["cf_clearance"].value)
+    if len(values) != 1:
+        raise ValueError("expected one unambiguous cf_clearance cookie for discord.com")
+    return "cf_clearance=" + values.pop()
+
+
+def positive_count(raw: str) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("game count must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError("game count must be a positive integer")
+    return value
+
+
+def valid_hours(raw: str) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("hours must be a positive finite number") from exc
+    ms = value * 3_600_000
+    if not math.isfinite(ms) or ms < 1 or ms > min(int(time.time() * 1000), 2**53 - 1):
+        raise ValueError("hours must span at least 1ms and cannot backdate before 1970")
+    return value
+
+
+def dry_run(games_file: Path, count: int, hours: float) -> None:
+    """Build a credential-free preview from local data only; never read account state."""
+    count = positive_count(str(count))
+    hours = valid_hours(str(hours))
+    games = _parse_games(games_file.read_text(encoding="utf-8-sig"))
+    if count > len(games):
+        raise ValueError(f"game count exceeds the {len(games)} available games")
+    props = _local_props()
+    session = Session(str(uuid.uuid4()), str(uuid.uuid4()),
+                      base64.b64encode(json.dumps(props).encode()).decode())
+    client = ScienceClient(State(), session)
+    events = [event for game in games[:count]
+              for event in client.build_session(game, int(hours * 3_600_000))]
+    print(json.dumps({"dry_run": True, "games": count, "hours_per_game": hours,
+                      "events": events}, indent=2))
 
 def _user_id_from_token(token: str) -> str:
     # discord tokens start with base64(user_id) before the first dot
@@ -296,8 +424,7 @@ class Console:
     def banner(self) -> None:
         self.clear()
         print()
-        print(f"  {self.ORANGE}spoofer{self.RESET} {self.GREY}·{self.RESET} {self.WHITE}discord badges{self.RESET}")
-        print(f"    {self.GREY}by revere group{self.RESET}")
+        print(f"  {self.ORANGE}kanashi{self.RESET} {self.GREY}·{self.RESET} {self.WHITE}discord badges{self.RESET}")
         print()
 
 
@@ -312,9 +439,8 @@ class State:
     fetched_at: int = 0
     used_games: list[str] = None  # game ids already claimed, rotate to avoid repeats
     total_games_claimed: int = 0  # cumulative games claimed in this session
-    total_hours_claimed: float = 0.0  # cumulative hours claimed in this session
-    subscribed: bool = False  # passed the youtube step once
-    joined_discord: bool = False  # passed the discord step once
+    total_hours_claimed: float = 0.0  # accepted requests, not confirmed badges
+    pending_run: dict | None = None  # durable per-game delivery journal
 
     def __post_init__(self) -> None:
         if self.used_games is None:
@@ -330,7 +456,58 @@ class State:
         return cls()
 
     def save(self) -> None:
-        STATE_FILE.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        # Replace atomically so interruption cannot leave a half-written journal.
+        fd, name = tempfile.mkstemp(prefix=".kanashi-", suffix=".tmp", dir=STATE_FILE.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(asdict(self), stream, indent=2, allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, STATE_FILE)
+        finally:
+            Path(name).unlink(missing_ok=True)
+
+    def begin_run(self, games: Sequence[Game], hours: float) -> None:
+        self.pending_run = {"hours": valid_hours(str(hours)),
+                            "games": [{**asdict(game), "status": "pending"} for game in games]}
+        self.save()
+
+    def resumable_games(self) -> list[Game]:
+        if not self.pending_run:
+            return []
+        # A terminated process may have sent these requests without persisting an ACK.
+        changed = False
+        for entry in self.pending_run["games"]:
+            if entry["status"] == "inflight":
+                entry["status"] = "uncertain"
+                changed = True
+        if changed:
+            self.save()
+        return [Game(entry["id"], entry["name"], entry["exe"])
+                for entry in self.pending_run["games"]
+                if entry["status"] in ("pending", "rejected")]
+
+    def begin_batch(self, games: Sequence[Game]) -> None:
+        ids = {game.id for game in games}
+        for entry in self.pending_run["games"]:
+            if entry["id"] in ids:
+                entry["status"] = "inflight"
+        self.save()
+
+    def finish_batch(self, games: Sequence[Game], status: int | None) -> None:
+        ids = {game.id for game in games}
+        accepted = []
+        outcome = ("accepted" if status == 204 else "pending" if status is None
+                   else "rejected" if status in (401, 403, 429) else "uncertain")
+        for entry in self.pending_run["games"]:
+            if entry["id"] in ids and entry["status"] != "accepted":
+                entry["status"] = outcome
+                if outcome == "accepted":
+                    accepted.append(entry["id"])
+        self.used_games = [gid for gid in self.used_games if gid not in accepted] + accepted
+        self.total_games_claimed += len(accepted)
+        self.total_hours_claimed += len(accepted) * self.pending_run["hours"]
+        self.save()
 
     @property
     def is_stale(self) -> bool:
@@ -373,7 +550,7 @@ def build_super_props(launch_signature: str, heartbeat_session: str) -> str:
     try:
         req = urllib.request.Request(PROPERTIES_URL, method="POST", data=b"{}",
                                      headers={"content-type": "application/json", "user-agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with open_url(req, timeout=10) as response:
             props = json.loads(response.read().decode("utf-8"))["properties"]
     except Exception:
         props = _local_props()
@@ -392,7 +569,7 @@ def _read_analytics_token(auth_token: str, super_props: str) -> str:
         "x-super-properties": super_props,
     })
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with open_url(req, timeout=15) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"token rejected ({exc.code})") from exc
@@ -435,14 +612,14 @@ class Game:
 
 def _win_exe(game: dict) -> str:
     for entry in game.get("executables", []):
-        if entry.get("os") == "win32" and entry.get("name"):
+        if isinstance(entry, dict) and entry.get("os") == "win32" and isinstance(entry.get("name"), str) and entry["name"]:
             return entry["name"]
     return "game.exe"
 
 
 def _download_games() -> str:
     request = urllib.request.Request(GAMES_CDN_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with open_url(request, timeout=30) as response:
         raw = response.read().decode("utf-8")
     try:
         GAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -454,16 +631,20 @@ def _download_games() -> str:
 
 def _parse_games(raw: str) -> list[Game]:
     data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("game catalog must be a JSON array")
     games: list[Game] = []
     seen: set[str] = set()
     for entry in data:
+        if not isinstance(entry, dict) or not isinstance(entry.get("executables", []), list):
+            continue
         gid = str(entry.get("id", ""))
         if not gid.isdigit() or gid in seen:
             continue
-        if not any(e.get("os") == "win32" and e.get("name") for e in entry.get("executables", [])):
+        if not any(isinstance(e, dict) and e.get("os") == "win32" and isinstance(e.get("name"), str) and e["name"] for e in entry.get("executables", [])):
             continue
         seen.add(gid)
-        games.append(Game(gid, entry.get("name", "Unknown"), _win_exe(entry)))
+        games.append(Game(gid, entry["name"] if isinstance(entry.get("name"), str) else "Unknown", _win_exe(entry)))
     return games
 
 
@@ -604,14 +785,10 @@ class ScienceClient:
             "x-super-properties": self.session.super_props,
         }
         if DEBUG:
-            print("\n" + "=" * 72)
-            print(f"POST {SCIENCE_URL} ({len(payload['events'])} events)")
-            print("headers:", json.dumps(headers, indent=2))
-            print("body:", json.dumps(payload, indent=2))
-            print("=" * 72)
+            print(f"POST {SCIENCE_URL} ({len(events)} events; credentials redacted)")
         request = urllib.request.Request(SCIENCE_URL, data=body, method="POST", headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with open_url(request, timeout=15) as response:
                 return response.status
         except urllib.error.HTTPError as exc:
             return exc.code
@@ -627,34 +804,97 @@ def _chunked(items: Sequence[Game], size: int) -> Iterator[Sequence[Game]]:
 class Spoofer:
     """sends events in batches and logs progress."""
 
-    def __init__(self, client: ScienceClient, console: Console) -> None:
+    def __init__(self, client: ScienceClient, console: Console, workers: int = 1) -> None:
+        if not 1 <= workers <= 8:
+            raise ValueError("workers must be between 1 and 8")
         self.client = client
         self.console = console
+        self.workers = workers
 
-    def run(self, games: Sequence[Game], build_events) -> int:
-        # build_events(game) -> list of event dicts to send for that game
-        total = len(games)
-        sent_ok = 0
-        for request_no, chunk in enumerate(_chunked(games, BATCH_SIZE), start=1):
-            events = []
-            for game in chunk:
-                events.extend(build_events(game))
+    def run(self, games: Sequence[Game], build_events, on_start=None, on_result=None) -> int:
+        # Construct events on the caller thread, so sequence numbers stay unique.
+        # Bound outstanding requests and keep a single pacing budget for all workers.
+        stop = threading.Event()
+        pacing = threading.Lock()
+        next_start = 0.0
+
+        def send(events):
+            nonlocal next_start
+            with pacing:
+                if stop.wait(max(0.0, next_start - time.monotonic())):
+                    return None
+                next_start = time.monotonic() + BATCH_DELAY
+            if stop.is_set():
+                return None
             status = self.client.post(events)
-            if status == 204:
-                sent_ok += len(chunk)
-                self.console.sent(f"batch {request_no}", f"{sent_ok}/{total} games")
-            elif status in (401, 403):
-                self.console.err(f"batch {request_no}",
-                                 f"[{status}] auth rejected · refresh (option 3) with a fresh cookie")
-                return sent_ok
-            else:
-                self.console.warn(f"batch {request_no}", f"[{status}]")
-            time.sleep(BATCH_DELAY)
+            if status in (401, 403, 429):
+                stop.set()
+            return status
+
+        chunks = iter(enumerate(_chunked(games, BATCH_SIZE), start=1))
+        sent_ok = 0
+        pending = {}
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            def submit_next():
+                if stop.is_set():
+                    return False
+                item = next(chunks, None)
+                if item is None:
+                    return False
+                number, chunk = item
+                events = [event for game in chunk for event in build_events(game)]
+                if on_start:
+                    on_start(chunk)
+                pending[pool.submit(send, events)] = (number, chunk)
+                return True
+
+            def record(future):
+                nonlocal sent_ok
+                number, chunk = pending.pop(future)
+                if future.cancelled():
+                    status = None
+                else:
+                    try:
+                        status = future.result()
+                    except Exception:
+                        status = 0  # Delivery is unknown; never replay automatically.
+                if on_result:
+                    on_result(chunk, status)
+                if status == 204:
+                    sent_ok += len(chunk)
+                    self.console.sent(f"batch {number}", f"{sent_ok}/{len(games)} games accepted")
+                elif status in (401, 403):
+                    self.console.err(f"batch {number}", f"[{status}] auth rejected; refresh with option 2")
+                elif status == 429:
+                    self.console.warn(f"batch {number}", "[429] rate limited; stopped without retrying")
+                elif status is not None:
+                    self.console.warn(f"batch {number}", f"[{status}] delivery uncertain; not retried")
+
+            try:
+                for _ in range(self.workers):
+                    if not submit_next():
+                        break
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        record(future)
+                    while len(pending) < self.workers and submit_next():
+                        pass
+            except BaseException:
+                stop.set()
+                for future in pending:
+                    future.cancel()
+                # Drain in-flight requests and persist successful ACKs before leaving.
+                wait(pending)
+                for future in list(pending):
+                    record(future)
+                raise
         return sent_ok
 
 
 class App:
-    def __init__(self) -> None:
+    def __init__(self, workers: int = 1) -> None:
+        self.workers = workers
         self.console = Console()
         self.state = State.load()
         self.session: Session | None = None
@@ -663,57 +903,10 @@ class App:
 
     # startup
 
-    def _flush_stdin(self) -> None:
-        # drop keys pressed during the countdown so an early enter doesn't skip the gate
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-                while msvcrt.kbhit():
-                    msvcrt.getwch()
-            else:
-                import termios
-                termios.tcflush(sys.stdin, termios.TCIFLUSH)
-        except Exception:
-            pass
-
-    def _gate_step(self, step: int, total: int, action: str, label: str, url: str, done: str) -> None:
-        C = self.console
-        C.rule()
-        C.info(f"{C.ORANGE}step {step} of {total}{C.WHITE} · {action} {C.ORANGE}{label}{C.WHITE} to continue")
-        C.rule()
-        C.info("opening it in your browser...")
-        webbrowser.open(url)
-        for left in range(GATE_WAIT, 0, -1):
-            print(f"\r  {C.GREY}continue available in {left}s...{C.RESET}  ", end="", flush=True)
-            time.sleep(1)
-        print("\r" + " " * 40 + "\r", end="")
-        self._flush_stdin()
-        input(f"  {C.ORANGE}›{C.RESET} press enter once you've {done} ")
-        print()
-
-    def _gate(self) -> None:
-        # (state flag, action, label, url, past tense) - shown in order, each only until passed once
-        steps = [
-            ("subscribed", "subscribe to", "youtube.com/@solasity", SUBSCRIBE_URL, "subscribed"),
-            ("joined_discord", "join", DISCORD_INVITE_LABEL, DISCORD_INVITE_URL, "joined"),
-        ]
-        total = len(steps)
-        for i, (flag, action, label, url, done) in enumerate(steps, 1):
-            if getattr(self.state, flag):
-                continue
-            self._gate_step(i, total, action, label, url, done)
-            setattr(self.state, flag, True)
-            self.state.save()
-        self.console.ok("setup", f"all {total} steps done · thanks!")
-        time.sleep(0.5)
-
     def start(self) -> None:
         self.console.banner()
         time.sleep(0.8)
         print()
-
-        if not (self.state.subscribed and self.state.joined_discord):
-            self._gate()
 
         # step 1: token
         C = self.console
@@ -788,10 +981,14 @@ class App:
             time.sleep(1.5)
 
     def _prompt_cookie(self) -> None:
-        self.console.info("paste your cf_clearance cookie header")
+        self.console.info("paste cookies (Cookie header or one-line JSON); cf_clearance is extracted")
         entered = input(f"  {self.console.GREY}cookie:{self.console.RESET} ").strip()
         if entered:
-            self.state.cookie = entered
+            try:
+                self.state.cookie = extract_clearance(entered)
+            except ValueError as exc:
+                self.console.err("cookie", str(exc))
+                return
             self.state.save()
             self.console.ok("cookie", "saved")
             time.sleep(1.5)
@@ -803,7 +1000,11 @@ class App:
             self.console.info("paste a fresh cookie header")
             entered = input(f"  {self.console.GREY}cookie:{self.console.RESET} ").strip()
             if entered:
-                self.state.cookie = entered
+                try:
+                    self.state.cookie = extract_clearance(entered)
+                except ValueError as exc:
+                    self.console.err("cookie", str(exc))
+                    return
                 self.console.ok("cookie", "updated")
             else:
                 self.console.info("cookie unchanged")
@@ -822,7 +1023,7 @@ class App:
 
     def _require_ready(self) -> bool:
         if not self.state.has_cookie:
-            self.console.err("cookie", "not set · use option 3 to add one")
+            self.console.err("cookie", "not set · use option 2 to add one")
             return False
         if self.state.is_stale:
             try:
@@ -837,82 +1038,66 @@ class App:
 
     def claim_games(self) -> None:
         """claim playtime on selected games. prompts for count and hours."""
-        if not self._require_ready():
-            return
         C = self.console
         print()
         C.info(f"loaded {C.GREEN}{len(self.games)}{C.WHITE} games available")
 
-        # prompt for game count
         raw_count = input(f"  {C.GREY}how many games? [all]:{C.RESET} ").strip()
         try:
-            count = int(raw_count) if raw_count else len(self.games)
-        except ValueError:
-            C.err("input", "invalid count")
+            count = positive_count(raw_count) if raw_count else len(self.games)
+            if not 1 <= count <= len(self.games):
+                raise ValueError(f"game count must be between 1 and {len(self.games)}")
+            raw_hours = input(f"  {C.GREY}hours per game? [1]:{C.RESET} ").strip()
+            hours = valid_hours(raw_hours or "1")
+        except ValueError as exc:
+            C.err("input", str(exc))
             return
-        count = min(count, len(self.games))
-
-        # prompt for hours
-        raw_hours = input(f"  {C.GREY}hours per game? [1]:{C.RESET} ").strip()
-        try:
-            hours = float(raw_hours) if raw_hours else 1.0
-        except ValueError:
-            C.err("input", "invalid hours")
+        if self.state.pending_run and any(e["status"] != "accepted" for e in self.state.pending_run["games"]):
+            C.warn("progress", "an unfinished run exists; use option 5 to resume")
+            answer = input("  replace its journal with a new run? [y/N]: ").strip().lower()
+            if answer not in ("y", "yes"):
+                return
+        if not self._require_ready():
             return
-
-        # select games: prefer unused, rotate through used if necessary
         selected = self._select_games(count)
+        self.state.begin_run(selected, hours)
+        self._run_saved(selected)
+
+    def _run_saved(self, selected: Sequence[Game]) -> None:
+        hours = valid_hours(str(self.state.pending_run["hours"]))
+        try:
+            ok = Spoofer(self.client, self.console, self.workers).run(
+                selected,
+                lambda game: self.client.build_session(game, int(hours * 3_600_000)),
+                on_start=self.state.begin_batch,
+                on_result=self.state.finish_batch,
+            )
+            self.console.ok("complete", f"{ok}/{len(selected)} games accepted in this attempt")
+        except KeyboardInterrupt:
+            self.console.warn("stopped", "finished requests saved; use option 5 to resume")
+        entries = self.state.pending_run["games"]
+        counts = {status: sum(e["status"] == status for e in entries)
+                  for status in ("accepted", "pending", "rejected", "uncertain")}
+        self.console.info("progress: " + " · ".join(f"{key}={value}" for key, value in counts.items()))
+        self.console.info("accepted requests do not confirm badge changes; uncertain requests are never replayed automatically")
+
+    def resume_games(self) -> None:
+        selected = self.state.resumable_games()
         if not selected:
-            C.err("games", "none selected")
+            self.console.info("no pending/rejected games to resume; accepted and uncertain entries are excluded")
             return
-
-        duration_ms = int(hours * 3600 * 1000)
-        total_hours = len(selected) * hours
-        print()
-        C.info(
-            f"claiming {C.ORANGE}{hours:g}h{C.WHITE} on "
-            f"{C.ORANGE}{len(selected)}{C.WHITE} games "
-            f"{C.GREY}·{C.WHITE} {total_hours:,.0f}h total"
-        )
-        C.rule()
-        ok = Spoofer(self.client, self.console).run(
-            selected,
-            lambda g: self.client.build_session(g, duration_ms),
-        )
-        print()
-        C.ok("complete", f"{ok}/{len(selected)} games · {ok * hours:,.0f}h claimed")
-        # accumulate stats
-        self.state.total_games_claimed += ok
-        self.state.total_hours_claimed += ok * hours
-        self.state.save()
-
-        C.rule()
-        input(f"  {C.ORANGE}›{C.RESET} press enter to continue")
-        C.rule()
+        valid_hours(str(self.state.pending_run["hours"]))
+        if self._require_ready():
+            self._run_saved(selected)
 
     def _select_games(self, count: int) -> list[Game]:
-        """select N games, preferring unused ones and rotating through used to avoid repeats."""
-        available_ids = {g.id for g in self.games}
-        unused_ids = [g.id for g in self.games if g.id not in self.state.used_games]
-        used_ids = [gid for gid in self.state.used_games if gid in available_ids]
-
-        # if we have enough unused, take from there
-        if len(unused_ids) >= count:
-            selected_ids = unused_ids[:count]
-        else:
-            # fill with unused, then rotate through used
-            selected_ids = unused_ids
-            if used_ids:
-                remaining = count - len(selected_ids)
-                rotated = used_ids[remaining:] + used_ids[:remaining]
-                selected_ids.extend(rotated[:remaining])
-
-        # track them for next run
-        self.state.used_games = [gid for gid in self.state.used_games if gid not in selected_ids] + selected_ids
-
-        # map back to Game objects
-        id_map = {g.id: g for g in self.games}
-        return [id_map[gid] for gid in selected_ids if gid in id_map]
+        """Select without mutating progress; only successful ACKs mark games used."""
+        if not 1 <= count <= len(self.games):
+            raise ValueError("game count exceeds available games")
+        id_map = {game.id: game for game in self.games}
+        unused = [game for game in self.games if game.id not in self.state.used_games]
+        used = [id_map[gid] for gid in dict.fromkeys(self.state.used_games) if gid in id_map]
+        return (unused + used)[:count]
 
     # menu
 
@@ -961,12 +1146,13 @@ class App:
             print()
             # show stats
             C.info(f"loaded {C.ORANGE}{len(self.games)}{C.WHITE} games")
-            C.info(f"claimed {C.ORANGE}{self.state.total_games_claimed}{C.WHITE} games · {C.ORANGE}{self.state.total_hours_claimed:,.0f}h{C.WHITE} total")
+            C.info(f"accepted {C.ORANGE}{self.state.total_games_claimed}{C.WHITE} games · {C.ORANGE}{self.state.total_hours_claimed:,.0f}h{C.WHITE} total")
             C.rule()
             C.info(f"{C.ORANGE}1{C.RESET} · claim games")
             C.info(f"{C.ORANGE}2{C.RESET} · refresh auth")
             C.info(f"{C.ORANGE}3{C.RESET} · set fingerprint")
             C.info(f"{C.ORANGE}4{C.RESET} · exit")
+            C.info(f"{C.ORANGE}5{C.RESET} · resume saved run")
             C.rule()
             choice = input(f"  {C.ORANGE}›{C.RESET} ").strip()
             print()
@@ -976,6 +1162,8 @@ class App:
                 self._refresh()
             elif choice == "3":
                 self.set_fingerprint()
+            elif choice == "5":
+                self.resume_games()
             elif choice in ("4", ""):
                 break
             else:
@@ -983,9 +1171,43 @@ class App:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="kanashi", description="kanashi Discord badge CLI")
+    parser.add_argument("--workers", type=int, choices=range(1, 9), default=1,
+                        metavar="1-8", help="concurrent requests (default: 1); shared pacing is preserved")
+    parser.add_argument("--proxy", default=os.environ.get("KANASHI_PROXY"),
+                        help="one HTTP(S) proxy URL for all requests; defaults to KANASHI_PROXY/system proxy")
+    parser.add_argument("--cookies", type=Path, help="read cf_clearance from a Cookie header, JSON or Netscape file")
+    parser.add_argument("--dry-run", action="store_true", help="offline preview; no auth, network or state changes")
+    parser.add_argument("--games-file", type=Path, help="local catalog for dry-run (default: existing game cache)")
+    parser.add_argument("--count", type=positive_count, default=None, help="games to preview with --dry-run")
+    parser.add_argument("--hours", type=valid_hours, default=None, help="hours per game for --dry-run")
+    args = parser.parse_args()
+    if not args.dry_run and (args.games_file is not None or args.count is not None or args.hours is not None):
+        parser.error("--games-file, --count and --hours require --dry-run")
+    if args.dry_run and (args.cookies is not None or args.proxy is not None):
+        # Environment proxy settings are harmless: no networking occurs in this path.
+        if args.cookies is not None or "--proxy" in sys.argv or any(a.startswith("--proxy=") for a in sys.argv):
+            parser.error("--cookies/--proxy cannot be combined with --dry-run")
     try:
-        App().start()
-    except KeyboardInterrupt:
+        if args.dry_run:
+            try:
+                dry_run(args.games_file or GAMES_FILE, args.count or 1, args.hours if args.hours is not None else 1.0)
+            except (OSError, UnicodeError):
+                parser.error("dry-run requires a readable UTF-8 local catalog; use --games-file")
+            return
+        configure_proxy(args.proxy)
+        app = App(workers=args.workers)
+        if args.cookies:
+            try:
+                cookie = extract_clearance(args.cookies.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError):
+                parser.error("could not read cookies file as UTF-8")
+            app.state.cookie = cookie
+            app.state.save()
+        app.start()
+    except ValueError as exc:
+        parser.error(str(exc))
+    except (KeyboardInterrupt, EOFError):
         print()
         Console().warn("exit", "interrupted")
 

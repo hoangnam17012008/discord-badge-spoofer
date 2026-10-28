@@ -8,3 +8,6 @@ __pycache__/
 
 # game cache
 data/
+
+# interrupted atomic state writes may contain credentials
+.kanashi-*.tmp
